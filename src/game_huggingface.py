@@ -3,7 +3,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 
-from shapiq.games.base import Game
+from shapiq import Game
 
 
 class VisionLanguageGame(Game):

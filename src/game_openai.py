@@ -8,7 +8,7 @@ except ImportError:
     print("Warning: no clip module found")
 import torch
 
-from shapiq.games.base import Game
+from shapiq import Game
 
 
 class CLIPGame(Game):
