@@ -1,0 +1,345 @@
+import copy
+import warnings
+
+import numpy as np
+from scipy.special import binom
+
+from shapiq.utils.sets import powerset
+
+
+class CoalitionSampler:
+    def __init__(
+        self,
+        n_players: int,
+        sampling_weights: np.ndarray,
+        pairing_trick: bool = False,
+        enforce_empty_full: bool = False,
+        random_state: int | None = None,
+    ) -> None:
+        self.pairing_trick: bool = pairing_trick
+
+        # set enforce_empty_full
+        self.enforce_empty_full = enforce_empty_full
+        # set sampling weights
+        if not (sampling_weights >= 0).all():  # Check non-negativity of sampling weights
+            raise ValueError("All sampling weights must be non-negative")
+        self._sampling_weights = sampling_weights / np.sum(sampling_weights)  # make probabilities
+
+        # raise warning if sampling weights are not symmetric but pairing trick is activated
+        if self.pairing_trick and not np.allclose(
+            self._sampling_weights, self._sampling_weights[::-1]
+        ):
+            warnings.warn(
+                UserWarning(
+                    "Pairing trick is activated, but sampling weights are not symmetric. "
+                    "This may lead to unexpected results."
+                ),
+                stacklevel=2,
+            )
+
+        # set player numbers
+        if n_players + 1 != np.size(sampling_weights):  # shape of sampling weights -> sizes 0,...,n
+            raise ValueError(
+                f"{n_players} elements must correspond to {n_players + 1} coalition sizes "
+                "(including empty subsets)"
+            )
+        self.n: int = n_players
+        self.n_max_coalitions = int(2**self.n)
+        self.n_max_coalitions_per_size = np.array([binom(self.n, k) for k in range(self.n + 1)])
+
+        # set random state
+        self._rng: np.random.Generator = np.random.default_rng(seed=random_state)
+
+        # set variables for sampling and exclude coalition sizes with zero weight
+        self._coalitions_to_exclude: list[int] = []
+        for size, weight in enumerate(self._sampling_weights):
+            if weight == 0 and 0 < size < self.n:
+                self.n_max_coalitions -= int(binom(self.n, size))
+                self._coalitions_to_exclude.extend([size])
+        self.adjusted_sampling_weights: np.ndarray[float] | None = None
+
+        # set sample size variables (for border trick)
+        self._coalitions_to_compute: list[int] | None = None  # coalitions to compute
+        self._coalitions_to_sample: list[int] | None = None  # coalitions to sample
+
+        # initialize variables to be computed and stored
+        self.sampled_coalitions_dict: dict[tuple[int, ...], int] | None = None  # coal -> count
+        self.coalitions_per_size: np.ndarray[int] | None = None  # number of coalitions per size
+
+        # variables accessible through properties
+        self._sampled_coalitions_matrix: np.ndarray[bool] | None = None  # coalitions
+        self._sampled_coalitions_counter: np.ndarray[int] | None = None  # coalitions_counter
+        self._is_coalition_size_sampled: np.ndarray[bool] | None = None  # is_coalition_size_sampled
+
+
+    @property
+    def is_coalition_size_sampled(self) -> np.ndarray:
+        return copy.deepcopy(self._is_coalition_size_sampled)
+
+
+    @property
+    def is_coalition_sampled(self) -> np.ndarray:
+        coalitions_size = np.sum(self.coalitions_matrix, axis=1)
+        return self._is_coalition_size_sampled[coalitions_size]
+
+
+    @property
+    def sampling_adjustment_weights(self) -> np.ndarray:
+        coalitions_counter = self.coalitions_counter
+        is_coalition_sampled = self.is_coalition_sampled
+        # Number of coalitions sampled
+
+        n_total_samples = np.sum(coalitions_counter[is_coalition_sampled])
+        # Helper array for computed and sampled coalitions
+        total_samples_values = np.array([1, n_total_samples])
+        # Create array per coalition and the total samples values, or 1, if computed
+        n_coalitions_total_samples = total_samples_values[is_coalition_sampled.astype(int)]
+        # Create array with the adjusted weights
+        sampling_adjustment_weights = self.coalitions_counter / (
+            self.coalitions_probability * n_coalitions_total_samples
+        )
+
+        return sampling_adjustment_weights
+
+    @property
+    def empirical_occurrences(self) -> np.ndarray:
+        coalitions_counter = self.coalitions_counter
+        is_coalition_sampled = self.is_coalition_sampled
+        # Number of coalitions sampled
+
+        n_total_samples = np.sum(coalitions_counter[is_coalition_sampled])
+        # Helper array for computed and sampled coalitions
+        total_samples_values = np.array([1, n_total_samples])
+        # Create array per coalition and the total samples values, or 1, if computed
+        n_coalitions_total_samples = total_samples_values[is_coalition_sampled.astype(int)]
+        # Create array with the adjusted weights
+        empirical_occurrences = self.coalitions_counter / n_coalitions_total_samples
+        return empirical_occurrences
+
+
+    @property
+    def coalitions_matrix(self) -> np.ndarray:
+        return copy.deepcopy(self._sampled_coalitions_matrix)
+
+
+    @property
+    def sampling_size_probabilities(self) -> np.ndarray:
+        size_probs = np.zeros(self.n + 1)
+        size_probs[self._coalitions_to_sample] = self.adjusted_sampling_weights / np.sum(
+            self.adjusted_sampling_weights
+        )
+        return size_probs
+
+
+    @property
+    def coalitions_counter(self) -> np.ndarray:
+        return copy.deepcopy(self._sampled_coalitions_counter)
+
+
+    @property
+    def coalitions_probability(self) -> np.ndarray:
+        if (
+            self._sampled_coalitions_size_prob is not None
+            and self._sampled_coalitions_in_size_prob is not None
+        ):
+            return self._sampled_coalitions_size_prob * self._sampled_coalitions_in_size_prob
+
+
+    @property
+    def coalitions_size(self) -> np.ndarray:
+        return np.sum(self.coalitions_matrix, axis=1)
+
+
+    @property
+    def empirical_occurrences(self) -> np.ndarray:
+        # Number of coalitions sampled
+        n_total_samples = np.sum(self.coalitions_counter[self.is_coalition_sampled])
+        # Helper array for computed and sampled coalitions
+        total_samples_values = np.array([1, n_total_samples])
+        # Create array per coalition and the total samples values, or 1, if computed
+        n_coalitions_total_samples = total_samples_values[self.is_coalition_sampled.astype(int)]
+        # Create array with the adjusted weights
+        empirical_occurrences = self.coalitions_counter / n_coalitions_total_samples
+        return copy.deepcopy(empirical_occurrences)
+
+
+    def execute_border_trick(self, sampling_budget: int) -> int:
+        coalitions_per_size = np.array([binom(self.n, k) for k in range(self.n + 1)])
+        expected_number_of_coalitions = sampling_budget * self.adjusted_sampling_weights
+        sampling_exceeds_expectation = (
+            expected_number_of_coalitions >= coalitions_per_size[self._coalitions_to_sample]
+        )
+        while sampling_exceeds_expectation.any():
+            coalitions_to_move = [
+                self._coalitions_to_sample[index]
+                for index, include in enumerate(sampling_exceeds_expectation)
+                if include
+            ]
+            self._coalitions_to_compute.extend(
+                [
+                    self._coalitions_to_sample.pop(self._coalitions_to_sample.index(move_this))
+                    for move_this in coalitions_to_move
+                ]
+            )
+            sampling_budget -= int(np.sum(coalitions_per_size[coalitions_to_move]))
+            self.adjusted_sampling_weights = self.adjusted_sampling_weights[
+                ~sampling_exceeds_expectation
+            ] / np.sum(self.adjusted_sampling_weights[~sampling_exceeds_expectation])
+            expected_number_of_coalitions = sampling_budget * self.adjusted_sampling_weights
+            sampling_exceeds_expectation = (
+                expected_number_of_coalitions >= coalitions_per_size[self._coalitions_to_sample]
+            )
+        return sampling_budget
+
+
+    def execute_pairing_trick(self, sampling_budget: int, coalition_tuple: tuple[int, ...]) -> int:
+        coalition_size = len(coalition_tuple)
+        paired_coalition_size = self.n - coalition_size
+        if paired_coalition_size in self._coalitions_to_sample:
+            paired_coalition_indices = list(set(range(self.n)) - set(coalition_tuple))
+            paired_coalition_tuple = tuple(sorted(paired_coalition_indices))
+            self.coalitions_per_size[paired_coalition_size] += 1
+            # adjust coalitions counter using the paired coalition
+            try:  # if coalition is not new
+                self.sampled_coalitions_dict[paired_coalition_tuple] += 1
+            except KeyError:  # if coalition is new
+                self.sampled_coalitions_dict[paired_coalition_tuple] = 1
+                sampling_budget -= 1
+        return sampling_budget
+
+
+    def _reset_variables(self, sampling_budget: int) -> None:
+        self.sampled_coalitions_dict = {}
+        self.coalitions_per_size = np.zeros(self.n + 1, dtype=int)
+        self._is_coalition_size_sampled = np.zeros(self.n + 1, dtype=bool)
+        self._sampled_coalitions_counter = np.zeros(sampling_budget, dtype=int)
+        self._sampled_coalitions_matrix = np.zeros((sampling_budget, self.n), dtype=bool)
+        self._sampled_coalitions_size_prob = np.zeros(sampling_budget, dtype=float)
+        self._sampled_coalitions_in_size_prob = np.zeros(sampling_budget, dtype=float)
+
+        self._coalitions_to_compute = []
+        self._coalitions_to_sample = [
+            coalition_size
+            for coalition_size in range(self.n + 1)
+            if coalition_size not in self._coalitions_to_exclude
+        ]
+        self.adjusted_sampling_weights = copy.deepcopy(
+            self._sampling_weights[self._coalitions_to_sample]
+        )
+        self.adjusted_sampling_weights /= np.sum(self.adjusted_sampling_weights)  # probability
+
+
+    def execute_empty_grand_coalition(self, sampling_budget):
+        empty_grand_coalition_indicator = np.zeros_like(self.adjusted_sampling_weights, dtype=bool)
+        empty_grand_coalition_size = [0, self.n]
+        empty_grand_coalition_index = [
+            self._coalitions_to_sample.index(size) for size in empty_grand_coalition_size
+        ]
+        empty_grand_coalition_indicator[empty_grand_coalition_index] = True
+        coalitions_to_move = [
+            self._coalitions_to_sample[index]
+            for index, include in enumerate(empty_grand_coalition_indicator)
+            if include
+        ]
+        self._coalitions_to_compute.extend(
+            [
+                self._coalitions_to_sample.pop(self._coalitions_to_sample.index(move_this))
+                for move_this in coalitions_to_move
+            ]
+        )
+        self.adjusted_sampling_weights = self.adjusted_sampling_weights[
+            ~empty_grand_coalition_indicator
+        ] / np.sum(self.adjusted_sampling_weights[~empty_grand_coalition_indicator])
+        sampling_budget -= 2
+        return sampling_budget
+
+
+    def sample(self, sampling_budget: int) -> None:
+        if sampling_budget > self.n_max_coalitions:
+            warnings.warn("Not all budget is required due to the border-trick.", stacklevel=2)
+            sampling_budget = min(sampling_budget, self.n_max_coalitions)  # set budget to max coals
+
+        self._reset_variables(sampling_budget)
+
+        if self.enforce_empty_full:
+            # Prioritize empty and grand coalition
+            sampling_budget = self.execute_empty_grand_coalition(sampling_budget)
+
+        # Border-Trick: enumerate all coalitions, where the expected number of coalitions exceeds
+        # the total number of coalitions of that size (i.e. binom(n_players, coalition_size))
+        sampling_budget = self.execute_border_trick(sampling_budget)
+
+        # Sort by size for esthetics
+        self._coalitions_to_compute.sort(key=self._sort_coalitions)
+
+        # raise warning if budget is higher than 90% of samples remaining to be sampled
+        n_samples_remaining = np.sum([binom(self.n, size) for size in self._coalitions_to_sample])
+        if sampling_budget > 0.9 * n_samples_remaining:
+            warnings.warn(
+                UserWarning(
+                    "Sampling might be inefficient (stalls) due to the sampling budget being close "
+                    "to the total number of coalitions to be sampled."
+                ),
+                stacklevel=2,
+            )
+
+        # sample coalitions
+        if len(self._coalitions_to_sample) > 0:
+            iteration_counter = 0  # stores the number of samples drawn (duplicates included)
+            while sampling_budget > 0:
+                iteration_counter += 1
+
+                # draw coalition
+                coalition_size = self._rng.choice(
+                    self._coalitions_to_sample, size=1, p=self.adjusted_sampling_weights
+                )[0]
+                ids = self._rng.choice(self.n, size=coalition_size, replace=False)
+                coalition_tuple = tuple(sorted(ids))  # get coalition
+                self.coalitions_per_size[coalition_size] += 1
+
+                # add coalition
+                try:  # if coalition is not new
+                    self.sampled_coalitions_dict[coalition_tuple] += 1
+                except KeyError:  # if coalition is new
+                    self.sampled_coalitions_dict[coalition_tuple] = 1
+                    sampling_budget -= 1
+
+                # execute pairing-trick by including the complement
+                if self.pairing_trick and sampling_budget > 0:
+                    sampling_budget = self.execute_pairing_trick(sampling_budget, coalition_tuple)
+
+        # convert coalition counts to the output format
+        coalition_index = 0
+        # add all coalitions that are computed exhaustively
+        for coalition_size in self._coalitions_to_compute:
+            self.coalitions_per_size[coalition_size] = int(binom(self.n, coalition_size))
+            for coalition in powerset(
+                range(self.n), min_size=coalition_size, max_size=coalition_size
+            ):
+                self._sampled_coalitions_matrix[coalition_index, list(coalition)] = 1
+                self._sampled_coalitions_counter[coalition_index] = 1
+                self._sampled_coalitions_size_prob[coalition_index] = 1  # weight is set to 1
+                self._sampled_coalitions_in_size_prob[coalition_index] = 1  # weight is set to 1
+                coalition_index += 1
+        # add all coalitions that are sampled
+        for coalition_tuple, count in self.sampled_coalitions_dict.items():
+            self._sampled_coalitions_matrix[coalition_index, list(coalition_tuple)] = 1
+            self._sampled_coalitions_counter[coalition_index] = count
+            # probability of the sampled coalition, i.e. sampling weight (for size) divided by
+            # number of coalitions of that size
+            self._sampled_coalitions_size_prob[coalition_index] = self.adjusted_sampling_weights[
+                self._coalitions_to_sample.index(len(coalition_tuple))
+            ]
+            self._sampled_coalitions_in_size_prob[coalition_index] = (
+                1 / self.n_max_coalitions_per_size[len(coalition_tuple)]
+            )
+            coalition_index += 1
+
+        # set the flag to indicate that these sizes are sampled
+        for coalition_size in self._coalitions_to_sample:
+            self._is_coalition_size_sampled[coalition_size] = True
+
+
+    def _sort_coalitions(self, value):
+        # Sort by distance to center
+        return -abs(self.n / 2 - value)
