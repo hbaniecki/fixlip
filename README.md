@@ -89,7 +89,7 @@ src.plot.plot_image_and_text_together(
 
 ## Faster and more reliable FIxLIP approximation
 
-Check out the demo for explaining CLIP with FIxLIP via ProxySHAP in [`example_faster.ipynb`](/example_faster.ipynb).
+Check out the demo for explaining CLIP with FIxLIP via [ProxySHAP](https://arxiv.org/abs/2605.22738) in [`example_faster.ipynb`](/example_faster.ipynb).
 
 ```python
 import src
