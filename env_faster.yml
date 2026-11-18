@@ -27,4 +27,5 @@ dependencies:
   - pip:
     - git+https://github.com/openai/clip.git
     - git+https://github.com/mmschlk/shapiq.git
+    - grad-cam
     - sentencepiece==0.2.0
